@@ -1,0 +1,152 @@
+name: iPhone - unsigned AltStore build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-sideload-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ios:
+    # Standard hosted runners are free for public repositories. Never run this
+    # workflow against a private repository or on a larger/paid runner.
+    if: github.event.repository.private == false
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      CI: '1'
+      EXPO_NO_TELEMETRY: '1'
+      NODE_ENV: production
+      DSH_REQUIRE_INTELLIGENT_UI: 'true'
+      DSH_INTELLIGENT_UI_RENDERER_BUNDLE: ${{ github.workspace }}/.deps/deepseek-harness-intelligent-ui/renderer/renderer.js
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Check out audited offline renderer
+        uses: actions/checkout@v6
+        with:
+          repository: dreamfarer-space/deepseek-harness-intelligent-ui
+          ref: bfb6b35f7ee94291629796d2b5eb577d20d8fa29
+          path: .deps/deepseek-harness-intelligent-ui
+
+      - name: Verify renderer source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C .deps/deepseek-harness-intelligent-ui rev-parse HEAD)" = bfb6b35f7ee94291629796d2b5eb577d20d8fa29
+          test "$(git -C .deps/deepseek-harness-intelligent-ui hash-object renderer/renderer.js)" = b8cb5e17bf7e77f3c9ed374edc0f994f358beeac
+
+      - name: Install locked dependencies
+        # The mobile workspace also needs development tools such as TypeScript.
+        run: pnpm install --frozen-lockfile --prod=false
+
+      - name: Build shared packages and mobile renderers
+        run: |
+          pnpm --filter './packages/**' -r build
+          pnpm --dir apps/android run verify:workspace
+          pnpm --dir apps/android run build:renderers
+
+      - name: Check mobile TypeScript
+        run: pnpm --dir apps/android exec tsc --noEmit
+
+      - name: Give the personal build a separate app identity
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const path = 'apps/android/app.json';
+          const data = JSON.parse(fs.readFileSync(path, 'utf8'));
+          data.expo.name = 'Harness Remote Marco';
+          data.expo.ios.bundleIdentifier = 'com.marcogori.harnessremote';
+          data.expo.ios.buildNumber = process.env.GITHUB_RUN_NUMBER;
+          // Preserve the protocol's OAuth callback scheme. For this first test,
+          // use QR sign-in if another installed client owns the same callback.
+          fs.writeFileSync(path, JSON.stringify(data, null, 2) + '\n');
+          NODE
+
+      - name: Generate native iOS project
+        run: pnpm --dir apps/android exec expo prebuild --platform ios --no-install
+
+      - name: Install CocoaPods dependencies
+        working-directory: apps/android/ios
+        run: pod install
+
+      - name: Archive for a physical iPhone without Apple signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/ios
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          WORKSPACE=$(find apps/android/ios -maxdepth 1 -name '*.xcworkspace' -print -quit)
+          test -n "$WORKSPACE"
+          xcodebuild -list -json -workspace "$WORKSPACE" > artifacts/ios/xcode-project.json
+          SCHEME=$(node --input-type=module -e "import fs from 'node:fs'; const p=JSON.parse(fs.readFileSync('artifacts/ios/xcode-project.json','utf8')); const s=p.workspace.schemes.filter(s=>!s.startsWith('Pods-')); if(s.length!==1) throw new Error('Expected one app scheme: '+s.join(', ')); console.log(s[0]);")
+          xcodebuild archive \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$PWD/artifacts/ios/HarnessRemote.xcarchive" \
+            -derivedDataPath "$RUNNER_TEMP/harness-ios-build" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            DEVELOPMENT_TEAM='' \
+            2>&1 | tee artifacts/ios/xcodebuild.log
+
+      - name: Package unsigned IPA for AltStore
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP=$(find artifacts/ios/HarnessRemote.xcarchive/Products/Applications -maxdepth 1 -name '*.app' -print -quit)
+          test -n "$APP"
+          EXECUTABLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")
+          file "$APP/$EXECUTABLE" | tee artifacts/ios/architecture.txt
+          grep -q arm64 artifacts/ios/architecture.txt
+          mkdir -p artifacts/ios/package/Payload
+          ditto "$APP" "artifacts/ios/package/Payload/$(basename "$APP")"
+          (cd artifacts/ios/package && ditto -c -k --keepParent Payload ../Harness-Remote-Marco-unsigned.ipa)
+          shasum -a 256 artifacts/ios/Harness-Remote-Marco-unsigned.ipa > artifacts/ios/SHA256SUMS
+          echo 'Unsigned iPhone build: install and sign using AltStore Classic on Windows. No Apple credentials were used by this workflow.' > artifacts/ios/INSTALL.txt
+          echo '## iPhone build ready' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Download the IPA artifact, then install it with AltStore Classic. Installation and connection to the PC still require an on-device test.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: Harness-Remote-Marco-iPhone-${{ github.run_number }}
+          path: |
+            artifacts/ios/*.ipa
+            artifacts/ios/SHA256SUMS
+            artifacts/ios/INSTALL.txt
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload build diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: iPhone-build-diagnostics-${{ github.run_number }}
+          path: |
+            artifacts/ios/xcodebuild.log
+            artifacts/ios/xcode-project.json
+          if-no-files-found: ignore
+          retention-days: 1

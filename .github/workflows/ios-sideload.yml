@@ -97,7 +97,8 @@ jobs:
           WORKSPACE=$(find apps/android/ios -maxdepth 1 -name '*.xcworkspace' -print -quit)
           test -n "$WORKSPACE"
           xcodebuild -list -json -workspace "$WORKSPACE" > artifacts/ios/xcode-project.json
-          SCHEME=$(node --input-type=module -e "import fs from 'node:fs'; const p=JSON.parse(fs.readFileSync('artifacts/ios/xcode-project.json','utf8')); const s=p.workspace.schemes.filter(s=>!s.startsWith('Pods-')); if(s.length!==1) throw new Error('Expected one app scheme: '+s.join(', ')); console.log(s[0]);")
+          SCHEME=HarnessRemoteMarco
+          node --input-type=module -e "import fs from 'node:fs'; const p=JSON.parse(fs.readFileSync('artifacts/ios/xcode-project.json','utf8')); if(!p.workspace.schemes.includes('HarnessRemoteMarco')) throw new Error('Personal app scheme is missing');"
           xcodebuild archive \
             -workspace "$WORKSPACE" \
             -scheme "$SCHEME" \
